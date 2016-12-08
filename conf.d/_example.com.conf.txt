@@ -1,0 +1,19 @@
+#!/bin/bash
+
+R_HOST=example.com
+R_PORT=22
+R_USER=root
+
+R_DIRS=(/data /var/log /var/aegir /var/www /root /etc /home)
+
+# The number backups to keep for each type.
+# Set the value to 0 to skip a particular type
+KEEP_DAYS=7	# 6 daily backups
+KEEP_WEEKS=4	# 3 weekly backups  
+KEEP_MONTHS=6	# 6 monthly backups 
+
+# order of types to make sure most rare are executed first   
+# monthly weekly daily   
+TYPES=(monthly weekly daily)
+
+
