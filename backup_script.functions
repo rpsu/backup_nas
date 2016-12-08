@@ -1,0 +1,290 @@
+#!/bin/bash
+# 
+# File:   backup_script.sh
+# Author: Perttu Ehn, Itusi Oy
+# License: GPL2
+#
+# Created on Jul 22, 2011, 3:54:37 PM
+# for Synology NAS (BusyBox), updated for QNAP NAS (Busybox)
+#
+# NOTE: This file is simply function library for a scriptfile backup_script.sh 
+#
+
+function print_usage {
+	echo "$0 usage:"
+	echo "backup_script.sh [<server>]"
+	echo "if <server> specified, assuming to conf file exist in /root/scripts/conf.d/<server>.'rsync.conf"
+	echo -e "if <server> NOT specified, searching files *.rsync.conf in /root/scripts/conf.d/\n\n"
+}
+
+
+function check_logfile () {
+	if [ ! -f $LOGFILE ]; then
+		$TOUCH $LOGFILE
+		chown $_ROOT_NAME:$_ROOT_GROUP $LOGFILE
+		chmod 640 $LOGFILE
+		echo -e "This file created $(date) by $0\n\n" >> $LOGFILE
+	fi
+	if [ ! -w $LOGFILE ]; then
+		echo "$(date) LOKI [$UNIQ]: " 
+		echo "PROBLEM: Logfile is not writable, and apparently creating it did not succeed." 
+		echo "Probably logs will be missing." 
+		ERRORS=$(($ERRORS + 1))
+	fi
+}
+
+function getNailConf {
+	local MAILCONF="$(echo ~)/.mailrc"
+	if [  -f $MAILCONF ]; then
+		. $MAILCONF
+	else 
+		set smtp=smtp.welho.com
+		set from=root@nasqu.sytes.net
+	fi
+}
+function logmailer {
+
+	echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+	echo "INFO: Logmailer has param 1 set as '$1'" >> $LOGFILE 	
+	echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+	echo "INFO: Logmailer has a tempfile '$MAIL_BODY_FILE'" >> $LOGFILE 	
+	
+	$TOUCH $MAIL_BODY_FILE
+	TOUCH_RES=$?
+	if [ ! -e  "$MAIL_BODY_FILE" ]; then
+		echo "Could not create MAIL_BODY_FILE-file for mailer!."
+	fi
+	if [ "$1" = "errors" ]; then
+		SUBJ="Backup encoutered some ERRORS in $(hostname)"
+		echo -e "Hi there,\n\n${1}\n\nRsyncing script file ${0} results are below. Truncated, short version.\n\n" > $MAIL_BODY_FILE
+		echo -e "-------------------------\n" >> $MAIL_BODY_FILE
+		grep "\ LOKI\ \[${UNIQ}\]\:" $LOGFILE | grep -v '@' >> $MAIL_BODY_FILE
+	else 
+		if [ "$1" = "ok" ]; then
+			SUBJ="Backups done in $(hostname)"
+			echo -e "Hi there,\n\n${1}\n\nBackups performed succesfully in $(hostname).\n\n" > $MAIL_BODY_FILE
+			echo "Server list: ${SRV_LIST[@]}." >> $MAIL_BODY_FILE
+		else 
+			echo "Backups done in $(hostname)"
+			echo -e "Hi there,\n\n${1}\n\nBackups performed succesfully in $(hostname).\n\n" 
+			echo "Server list: ${SRV_LIST[@]}." 
+			echo "Got vars... 0 = '$0', 1 = '$1', 2 = '$2', 3 = '$3'"
+			echo "Server list: ${SRV_LIST[@]}." 
+			echo "BUT MAILER FAILED!!"
+		fi
+	fi
+
+	# send mail even if logfile is not empty (test -s)
+	if [ ! -s $MAIL_BODY_FILE ];then
+		$TOUCH $MAIL_BODY_FILE
+		echo "$0, line 81(ish), FORCING stuff to be sent!!" >> $MAIL_BODY_FILE
+	fi
+
+	if [  -s $MAIL_BODY_FILE ]; then
+		cat $MAIL_BODY_FILE | $NAIL -s "$SUBJ" $MAILTO
+		if [ "$?" -ne "0" ]; then
+			echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+			echo "** ERROR **: Sending log failed, tried to send to $MAILTO" >> $LOGFILE
+		else
+			echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+			echo "Log mailed succesfully to $MAILTO" >> $LOGFILE
+		fi
+	else 
+		echo "File seems to be zero? $(ls -l $MAIL_BODY_FILE)"
+	fi
+	
+	# trash TMP -file 
+	$RM $MAIL_BODY_FILE
+
+}
+
+
+
+#-----------------------------------------------------
+# This function makes a hardlink copy of the older backup forlder, if it exists.
+#  The new folder name starts with "__", and contains the backup type and timestamp.
+# The function also deletes old backup folders (based on the BACKUP_TYPE_AGE
+# parameter). This is set in ./conf.d/<server>.conf -file. 
+# 
+function RotateAndRsync()
+{
+
+	BEGIN_TIME=$(date)
+
+	if [ -f ${CONF_DIR}/${SRC_SERVER}${CONF_EXT} ]; then
+		. ${CONF_DIR}/${SRC_SERVER}${CONF_EXT}
+	else
+		echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+		echo "Conf file missing: ${CONF_DIR}/${SRC_SERVER}${CONF_EXT}" >> $LOGFILE
+		return
+	fi
+	DATESTAMP=$(date +\%Y\-\%m\-\%d)
+	
+	# build up a server connection info
+	if [ ! -z "$R_USER" ] && [ ! -z "$R_HOST" ]; then
+		REMOTE_CONN="$R_USER@$R_HOST"
+	else
+		if [ ! -z "$R_HOST" ]; then
+			REMOTE_CONN="$R_HOST"
+		fi
+	fi
+	echo -e "\n\n=================================\n\n" >> $LOGFILE
+	echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+	echo "Now working on server ${R_HOST}" >> $LOGFILE
+
+	DO_BACKUP=0
+	DONE_ONE_BACKUP=0
+	for BACKUP_TYPE in "${TYPES[@]}"
+	do 
+		case $BACKUP_TYPE in
+			"monthly")
+				BACKUP_TYPE_INTERVAL=31
+	  			BACKUP_TYPE_AGE=$((${KEEP_MONTHS}*${BACKUP_TYPE_INTERVAL}))
+	  			if [ $(date +%e) -eq "1" ] && [ "$KEEP_MONTHS" -gt "0"  ] && [ "$DONE_ONE_BACKUP" -ne "1" ]; then
+	  				DO_BACKUP=1
+					DONE_ONE_BACKUP=1
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Perform a '$BACKUP_TYPE' backup now." >> $LOGFILE
+				else 
+	  				DO_BACKUP=0
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Tested '$BACKUP_TYPE' backup, but it is not time today to execute." >> $LOGFILE
+	  			fi
+				;;
+	
+			"weekly")
+		  		BACKUP_TYPE_INTERVAL=7
+		  		BACKUP_TYPE_AGE=$((${KEEP_WEEKS}*${BACKUP_TYPE_INTERVAL}))
+				if [ $(date +%e) -ne "1" ] && [ $(date +%u) -eq "1" ] && [ "$KEEP_WEEKS" -gt "0" ] && [ "$DONE_ONE_BACKUP" -ne "1" ]; then
+	  				DO_BACKUP=1
+					DONE_ONE_BACKUP=1
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Perform a '$BACKUP_TYPE' backup now." >> $LOGFILE
+				else 
+	  				DO_BACKUP=0
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Tested '$BACKUP_TYPE' backup, but it is not time today to execute." >> $LOGFILE
+				fi
+	  			;;
+	
+			"daily")
+		  		BACKUP_TYPE_INTERVAL=1
+		  		BACKUP_TYPE_AGE=$((${KEEP_DAYS}*${BACKUP_TYPE_INTERVAL}))
+				if [ "$KEEP_DAYS" -gt "0" ]  && [ "$DONE_ONE_BACKUP" -ne "1" ]; then
+	  				DO_BACKUP=1
+					DONE_ONE_BACKUP=1
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Perform a '$BACKUP_TYPE' backup now." >> $LOGFILE
+				else 
+	  				DO_BACKUP=0
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Skipping '$BACKUP_TYPE' backup since it's time of WEEKLY of MONTHLY backup." >> $LOGFILE
+	  			fi
+		  		;;
+		esac
+
+		BACKUP_TYPE_AGE=${BACKUP_TYPE_AGE:-0}
+		LASTBACKUP=
+		NEWDIR="__${R_HOST}_${BACKUP_TYPE}_${DATESTAMP}"
+		if [ "$DO_BACKUP" -gt "0" ]; then
+	
+			LASTBACKUP=$(ls -dt ${LOCAL_STORAGE}/__${R_HOST}_${BACKUP_TYPE}_*/ 2>/dev/null | $HEAD -1 )
+	
+			if [ ! -z "$LASTBACKUP" ]; then
+				LASTBACKUP=$(basename $LASTBACKUP)
+				echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+				echo "Found an older backup '$LASTBACKUP' for local hardlinking source." >> $LOGFILE
+			fi
+	
+	
+			# ================ #	
+			# 2. then loop through all dirs and rscync server to newdir/* 
+	
+			for SRV_DIR in "${R_DIRS[@]}"
+			do
+				echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+				echo "Working on dir '$SRV_DIR'." >> $LOGFILE
+				# LASTBACKUP is set within RotateFolder -function
+				if [ ! -z "$LASTBACKUP" ] ; then
+					LINK_DEST_IF_SET="--link-dest=${LOCAL_STORAGE}/${LASTBACKUP}${SRV_DIR}"
+				fi
+				SRV_DIR="${SRV_DIR%/}"
+				SOURCE="${REMOTE_CONN}:${SRV_DIR}"
+	
+				$MKDIR -p ${LOCAL_STORAGE}/${NEWDIR}${SRV_DIR}
+				#RS_COMMAND="$RSYNC $RSYNC_FLAGS --rsh \\"${SSH} -p ${R_PORT}\\" $LINK_DEST_IF_SET ${SOURCE}/ ${LOCAL_STORAGE}/${NEWDIR}${SRV_DIR}/"
+	
+				# test connection first...
+				echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+				echo "Testing ssh-connection (ie. is server responding?): '$SSH -p ${R_PORT} ${REMOTE_CONN}'" >> $LOGFILE
+				$SSH -p ${R_PORT} ${REMOTE_CONN}  "echo  2>&1" >/dev/null 2>&1
+				SSH_RETURN_VALUE=$?
+				RS_RETURN_CODE=0
+		 		if [ "$SSH_RETURN_VALUE" -eq "0" ]; then 
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "SSH-connection tested and ok for ${REMOTE_CONN}" >> $LOGFILE
+
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "Next rsyncthis: $RS_COMMAND" >> $LOGFILE		
+					echo "Next rsync: $RSYNC $RSYNC_FLAGS --rsh '${SSH} -p ${R_PORT}' $LINK_DEST_IF_SET ${SOURCE}/ ${LOCAL_STORAGE}/${NEWDIR}${SRV_DIR}/" >> $LOGFILE		
+					$RS_COMMAND>> $LOGFILE 2>&1
+					$RSYNC $RSYNC_FLAGS --rsh "$SSH -p $R_PORT" $LINK_DEST_IF_SET ${SOURCE}/ ${LOCAL_STORAGE}/${NEWDIR}${SRV_DIR}/>> $LOGFILE 2>&1
+					RS_RETURN_CODE=$?
+		 		else 
+					if [ "$SSH_RETURN_VALUE" -eq "255" ]; then 
+						RS_RETURN_CODE=-1
+						echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+						echo "** ERROR ** SSH-connection could not be established to ${REMOTE_CONN}. Maybe server is down? " >> $LOGFILE
+		 			
+					else 
+						if [ "$SSH_RETURN_VALUE" -eq "0" ]; then 
+							RS_RETURN_CODE=-1
+							echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+							echo "** ERROR ** SSH-connection could not be established to (using ${REMOTE_CONN}). Got odd return value '$SSH_RETURN_VALUE'." >> $LOGFILE
+						fi 
+					fi
+				fi
+				if [ "$RS_RETURN_CODE" -ne "0" ]; then
+					echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+					echo "** ERROR ** Previous command spitted out errors. Check your logs! ($LOGFILE)" >> $LOGFILE
+					ERRORS=$((${ERRORS}+1))
+				fi
+			done
+		fi
+	
+		# Delete directories that are older then the specified age for this type
+		FIND_CMD="$FIND ${LOCAL_STORAGE}/__${R_HOST}_${BACKUP_TYPE}_* -maxdepth 0 -daystart -mtime +$BACKUP_TYPE_AGE -print0"
+		XARGS_CMD="xargs -0 rm -rf  \;"
+		echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+		echo "Next deleting old backups... FIND: $FIND_CMD -> $XARGS_CMD" >> $LOGFILE
+		$FIND_CMD 2>/dev/null
+		if [ "$?" -ne "0" ] ; then
+			echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+			#echo "Possible error finding too old backups... check log!" >> $LOGFILE
+                        #ERRORS=$((${ERRORS}+1))
+		else	
+			$FIND_CMD 2>/dev/null | $XARGS_CMD \; 2>&1
+			if [ "$?" -ne "0" ] ; then
+				echo -n "$(date) LOKI [$UNIQ]: " >> $LOGFILE
+				echo "Possible error deleting too old backups... check log!" >> $LOGFILE
+                	        ERRORS=$((${ERRORS}+1))
+			fi	
+		fi
+
+		# Change the backup directory modification date, by adding a file
+		# to the root of the backup location, so that purging works
+		if [ -d "${LOCAL_STORAGE}/${NEWDIR}" ]; then
+			rm -f "${LOCAL_STORAGE}/${NEWDIR}/@BackupTime.*" 2>/dev/null
+			BU_STAMP_FILE="@BackupTime.$(date +%Y\-%m\-%d\_%H\-%M\-%S\_%A)"
+			SRV_BACKED_UP="${LOCAL_STORAGE}/${NEWDIR}/${BU_STAMP_FILE}"
+			$TOUCH ${LOCAL_STORAGE}/${NEWDIR}
+			$TOUCH ${SRV_BACKED_UP}
+			echo -e "Start of this backup: $BEGIN_TIME\nEnd of this backup  : $(date)" > $SRV_BACKED_UP
+			$UNLINK "${LOCAL_STORAGE}/${SRC_SERVER}" >> $LOGFILE 2>&1
+			ln -s "${LOCAL_STORAGE}/${NEWDIR}/" "${LOCAL_STORAGE}/${SRC_SERVER}" >> $LOGFILE 2>&1
+		fi
+
+	done
+	echo "$(date) LOKI [$UNIQ]: Finished with ${SRC_SERVER}." >> $LOGFILE
+
+}
